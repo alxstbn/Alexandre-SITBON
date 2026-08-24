@@ -1,0 +1,1 @@
+{"frames":[],"message":"Error in plot_km_publication(fit = km_hscore_pfs, ylab = \"Progression-free survival probability\",  : \n  unused argument (colors = c(\"#2C5F8A\", \"#B44A3C\"))\n"}

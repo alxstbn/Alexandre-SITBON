@@ -1,0 +1,1869 @@
+---
+title: "ALCINA — Survival analyses"
+subtitle: "HES-1, circulating tumor cells and circulating tumor DNA"
+date: today
+author: Alexandre Sitbon
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Afficher le code R"
+    code-tools: false
+    embed-resources: true
+    self-contained-math: true
+    theme: cosmo
+
+output-file: "ALCINA_survival_analysis_2026-08-24.html"
+
+execute:
+  warning: false
+  message: false
+---
+
+# Objectives
+
+The objective of this analysis was to investigate the association between baseline HES-1 expression, circulating tumor cells (CTC), circulating tumor DNA (ctDNA), and survival outcomes.
+
+The analyses correspond to the questions requested by Quentin:
+
+1.  Description of the distribution of nuclear and cytoplasmic HES-1 H-scores.
+2.  Association between nuclear and cytoplasmic H-scores and progression-free survival (PFS) and overall survival (OS), considering H-score as a continuous variable.
+3.  Association between nuclear H-score categories (\<100 versus \>200) and PFS and OS.
+4.  Association between baseline CTC count and PFS and OS.
+5.  Association between baseline ctDNA level and PFS and OS.
+6.  Association between ctDNA clearance at T2 and PFS and OS.
+
+```{r}
+#| label: setup
+#| include: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(survival)
+library(broom)
+library(gt)
+# Global style for ggplot figures
+theme_set(
+  theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 15
+      ),
+      axis.title = element_text(
+        face = "bold"
+      ),
+      axis.text = element_text(
+        size = 12
+      ),
+      legend.title = element_text(
+        face = "bold"
+      ),
+      legend.position = "top",
+      plot.margin = margin(
+        10, 15, 10, 10
+      )
+    )
+)
+# Global style for base R figures
+par(
+  las = 1,
+  bty = "l",
+  cex.axis = 1.1,
+  cex.lab = 1.2,
+  mar = c(5, 5, 2, 1)
+)
+```
+
+# Data import and quality control
+
+The dataset contained one row per patient. PFS and OS were expressed in days. Event indicators were coded as 1 for an observed event and 0 for a censored observation.
+
+No missing value was imputed.
+
+```{r}
+#| label: import-data
+#| echo: false
+
+df <- read_excel(
+  "stats_QT_phD_240826.xlsx",
+  na = c("", "NA")
+)
+
+names(df) <- tolower(names(df))
+```
+
+```{r}
+#| label: qc-data
+#| echo: false
+
+stopifnot(
+  all(df$pfs_event %in% c(0, 1)),
+  all(df$os_event %in% c(0, 1)),
+  all(df$pfs_days >= 0),
+  all(df$os_days >= 0),
+  !anyDuplicated(df$id)
+)
+
+qc <- df |>
+  summarise(
+    Patients = n(),
+    `PFS events` = sum(pfs_event),
+    `PFS censored` = sum(pfs_event == 0),
+    `OS events` = sum(os_event),
+    `OS censored` = sum(os_event == 0)
+  )
+
+qc |> gt()
+```
+
+Expected values are 24 patients, 9 PFS events and 13 OS events.
+
+# 1. Distribution of nuclear and cytoplasmic HES-1 H-scores
+
+> **Question from Quentin:**\
+> “For nuclear and cytoplasmic H-score, could you provide a dotplot representation of their distribution?”
+
+## Statistical analysis
+
+Nuclear and cytoplasmic HES-1 H-scores were described using individual patient values. Median and interquartile range (IQR) were reported.
+
+```{r}
+#| label: prepare-hscore
+#| echo: false
+
+hscore_long <- df |>
+  select(id, hscore_nuc, hscore_cyto) |>
+  pivot_longer(
+    cols = c(hscore_nuc, hscore_cyto),
+    names_to = "Localization",
+    values_to = "Hscore"
+  ) |>
+  mutate(
+    Localization = recode(
+      Localization,
+      hscore_nuc = "Nuclear",
+      hscore_cyto = "Cytoplasmic"
+    )
+  )
+```
+
+## Descriptive results
+
+```{r}
+#| label: hscore-summary
+#| echo: false
+
+hscore_summary <- hscore_long |>
+  group_by(Localization) |>
+  summarise(
+    N = sum(!is.na(Hscore)),
+    Median = median(Hscore, na.rm = TRUE),
+    Q1 = quantile(Hscore, 0.25, na.rm = TRUE),
+    Q3 = quantile(Hscore, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    `Median [IQR]` = sprintf(
+      "%.1f [%.1f–%.1f]",
+      Median, Q1, Q3
+    )
+  ) |>
+  select(Localization, N, `Median [IQR]`)
+
+hscore_summary |> gt()
+```
+
+## Dotplot
+
+```{r}
+#| label: fig-hscore-dotplot
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+#| fig-cap: "Distribution of baseline nuclear and cytoplasmic HES-1 H-scores."
+
+ggplot(
+  hscore_long,
+  aes(x = Localization, y = Hscore)
+) +
+  geom_jitter(
+    width = 0.08,
+    size = 2.5,
+    alpha = 0.8,
+    na.rm = TRUE
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "crossbar",
+    width = 0.3,
+    linewidth = 0.7,
+    na.rm = TRUE
+  ) +
+  labs(
+    x = NULL,
+    y = "H-score"
+  ) +
+  theme_classic(base_size = 13)
+```
+
+# 2. HES-1 H-score as a continuous variable and survival
+
+> **Question from Quentin:**\
+> “Could you evaluate PFS and OS according to H-score, considering H-score as a continuous variable?”
+
+## Statistical analysis
+
+Nuclear and cytoplasmic HES-1 H-scores were analyzed separately using univariable Cox proportional hazards models.
+
+For easier interpretation, H-scores were divided by 100. Hazard ratios therefore represent the change in hazard associated with a 100-point increase in H-score.
+
+```{r}
+#| label: prepare-hscore-continuous
+#| echo: false
+
+df <- df |>
+  mutate(
+    hscore_nuc_100 = hscore_nuc / 100,
+    hscore_cyto_100 = hscore_cyto / 100
+  )
+```
+
+```{r}
+#| label: cox-hscore
+#| echo: true
+
+cox_nuc_pfs <- coxph(
+  Surv(pfs_days, pfs_event) ~ hscore_nuc_100,
+  data = df
+)
+
+cox_nuc_os <- coxph(
+  Surv(os_days, os_event) ~ hscore_nuc_100,
+  data = df
+)
+
+cox_cyto_pfs <- coxph(
+  Surv(pfs_days, pfs_event) ~ hscore_cyto_100,
+  data = df
+)
+
+cox_cyto_os <- coxph(
+  Surv(os_days, os_event) ~ hscore_cyto_100,
+  data = df
+)
+```
+
+## Results
+
+```{r}
+#| label: table-hscore-cox
+#| echo: false
+
+hscore_results <- bind_rows(
+  
+  tidy(cox_nuc_pfs, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "PFS",
+      Predictor = "Nuclear H-score",
+      Scale = "+100 points",
+      N = cox_nuc_pfs$n,
+      Events = cox_nuc_pfs$nevent
+    ),
+  
+  tidy(cox_nuc_os, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "OS",
+      Predictor = "Nuclear H-score",
+      Scale = "+100 points",
+      N = cox_nuc_os$n,
+      Events = cox_nuc_os$nevent
+    ),
+  
+  tidy(cox_cyto_pfs, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "PFS",
+      Predictor = "Cytoplasmic H-score",
+      Scale = "+100 points",
+      N = cox_cyto_pfs$n,
+      Events = cox_cyto_pfs$nevent
+    ),
+  
+  tidy(cox_cyto_os, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "OS",
+      Predictor = "Cytoplasmic H-score",
+      Scale = "+100 points",
+      N = cox_cyto_os$n,
+      Events = cox_cyto_os$nevent
+    )
+) |>
+  transmute(
+    Outcome,
+    Predictor,
+    Scale,
+    N,
+    Events,
+    HR = estimate,
+    CI_low = conf.low,
+    CI_high = conf.high,
+    p_value = p.value
+  ) |>
+  mutate(
+    `HR [95% CI]` = sprintf(
+      "%.2f [%.2f–%.2f]",
+      HR, CI_low, CI_high
+    ),
+    `p-value` = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  select(
+    Outcome,
+    Predictor,
+    Scale,
+    N,
+    Events,
+    `HR [95% CI]`,
+    `p-value`
+  )
+
+hscore_results |> gt()
+```
+
+A HR greater than 1 indicates a higher hazard associated with increasing H-score, whereas a HR below 1 indicates a lower hazard.
+
+# 3. Nuclear HES-1 H-score categories and survival
+
+> **Question from Quentin:**\
+> “For nuclear H-score, patients with an H-score \<100 were classified as low and patients with an H-score \>200 as high.”
+
+## Statistical analysis
+
+Only nuclear H-score was categorized.
+
+- Low nuclear H-score: \<100
+- High nuclear H-score: \>200
+
+Patients with values between 100 and 200 were excluded from this categorical comparison.
+
+PFS and OS were estimated using Kaplan-Meier survival curves and compared using the log-rank test. Cox regression was used to estimate the hazard ratio for High versus Low H-score.
+
+```{r}
+#| label: prepare-hscore-category
+#| echo: false
+
+df_nuc <- df |>
+  mutate(
+    hscore_group = case_when(
+      hscore_nuc < 100 ~ "Low",
+      hscore_nuc > 200 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    hscore_group = factor(
+      hscore_group,
+      levels = c("Low", "High")
+    )
+  ) |>
+  filter(!is.na(hscore_group))
+```
+
+## Group composition
+
+```{r}
+#| label: hscore-group-count
+#| echo: false
+
+df_nuc |>
+  count(hscore_group) |>
+  rename(
+    Group = hscore_group,
+    N = n
+  ) |>
+  gt()
+```
+
+## Progression-free survival
+
+```{r}
+#| label: km-hscore-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+km_hscore_pfs <- survfit(
+  Surv(pfs_days, pfs_event) ~ hscore_group,
+  data = df_nuc
+)
+
+plot(
+  km_hscore_pfs,
+  xlab = "Time from inclusion (days)",
+  ylab = "Progression-free survival probability",
+  lty = 1:2,
+  lwd = 2,
+  mark.time = TRUE
+)
+
+legend(
+  "bottomleft",
+  legend = c("H-score <100", "H-score >200"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+#| echo: false
+
+summary(km_hscore_pfs, times = c(0, 180, 360, 540, 720, 900), extend = TRUE) |>
+  with(
+    tibble(
+      Group = sub("hscore_group=", "", strata),
+      Time = time,
+      `Number at risk` = n.risk
+    )
+  ) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+```
+
+```{r}
+#| label: logrank-hscore-pfs
+#| echo: false
+
+logrank_hscore_pfs <- survdiff(
+  Surv(pfs_days, pfs_event) ~ hscore_group,
+  data = df_nuc
+)
+
+p_hscore_pfs <- pchisq(
+  logrank_hscore_pfs$chisq,
+  df = 1,
+  lower.tail = FALSE
+)
+
+tibble(
+  Test = "Log-rank",
+  `p-value` = ifelse(
+    p_hscore_pfs < 0.001,
+    "<0.001",
+    sprintf("%.3f", p_hscore_pfs)
+  )
+) |> gt()
+```
+
+## Overall survival
+
+```{r}
+#| label: km-hscore-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+km_hscore_os <- survfit(
+  Surv(os_days, os_event) ~ hscore_group,
+  data = df_nuc
+)
+
+plot(
+  km_hscore_os,
+  xlab = "Time from inclusion (days)",
+  ylab = "Overall survival probability",
+  lty = 1:2,
+  lwd = 2,
+  mark.time = TRUE
+)
+
+legend(
+  "bottomleft",
+  legend = c("H-score <100", "H-score >200"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+#| echo: false
+
+summary(km_hscore_os, times = c(0, 180, 360, 540, 720, 900), extend = TRUE) |>
+  with(
+    tibble(
+      Group = sub("hscore_group=", "", strata),
+      Time = time,
+      `Number at risk` = n.risk
+    )
+  ) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+```
+
+```{r}
+#| label: logrank-hscore-os
+#| echo: false
+
+logrank_hscore_os <- survdiff(
+  Surv(os_days, os_event) ~ hscore_group,
+  data = df_nuc
+)
+
+p_hscore_os <- pchisq(
+  logrank_hscore_os$chisq,
+  df = 1,
+  lower.tail = FALSE
+)
+
+tibble(
+  Test = "Log-rank",
+  `p-value` = ifelse(
+    p_hscore_os < 0.001,
+    "<0.001",
+    sprintf("%.3f", p_hscore_os)
+  )
+) |> gt()
+
+#| label: survival-summary-hscore
+#| echo: false
+
+hscore_pfs_tab <- as.data.frame(summary(km_hscore_pfs)$table) |>
+  tibble::rownames_to_column("Group") |>
+  mutate(
+    Group = sub("hscore_group=", "", Group),
+    Outcome = "PFS"
+  )
+
+hscore_os_tab <- as.data.frame(summary(km_hscore_os)$table) |>
+  tibble::rownames_to_column("Group") |>
+  mutate(
+    Group = sub("hscore_group=", "", Group),
+    Outcome = "OS"
+  )
+
+bind_rows(hscore_pfs_tab, hscore_os_tab) |>
+  mutate(
+    `Median survival` = ifelse(
+      is.na(median),
+      "Not reached",
+      sprintf("%.0f days (%.1f months)", median, median / 30.44)
+    )
+  ) |>
+  transmute(
+    Outcome,
+    Group,
+    N = records,
+    Events = events,
+    `Median survival`
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Survival summary according to nuclear H-score"
+  )
+```
+
+## Cox estimates
+
+```{r}
+#| label: cox-hscore-category
+#| echo: true
+
+cox_hscore_group_pfs <- coxph(
+  Surv(pfs_days, pfs_event) ~ hscore_group,
+  data = df_nuc
+)
+
+cox_hscore_group_os <- coxph(
+  Surv(os_days, os_event) ~ hscore_group,
+  data = df_nuc
+)
+```
+
+```{r}
+#| label: table-hscore-category
+#| echo: false
+
+hscore_group_results <- bind_rows(
+  
+  tidy(
+    cox_hscore_group_pfs,
+    exponentiate = TRUE,
+    conf.int = TRUE
+  ) |>
+    mutate(
+      Outcome = "PFS",
+      N = cox_hscore_group_pfs$n,
+      Events = cox_hscore_group_pfs$nevent
+    ),
+  
+  tidy(
+    cox_hscore_group_os,
+    exponentiate = TRUE,
+    conf.int = TRUE
+  ) |>
+    mutate(
+      Outcome = "OS",
+      N = cox_hscore_group_os$n,
+      Events = cox_hscore_group_os$nevent
+    )
+) |>
+  transmute(
+    Outcome,
+    Predictor = "Nuclear H-score",
+    Scale = ">200 vs <100",
+    N,
+    Events,
+    HR = estimate,
+    CI_low = conf.low,
+    CI_high = conf.high,
+    p_value = p.value
+  ) |>
+  mutate(
+    `HR [95% CI]` = sprintf(
+      "%.2f [%.2f–%.2f]",
+      HR, CI_low, CI_high
+    ),
+    `p-value` = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  select(
+    Outcome,
+    Predictor,
+    Scale,
+    N,
+    Events,
+    `HR [95% CI]`,
+    `p-value`
+  )
+
+hscore_group_results |> gt()
+```
+
+# 
+
+# 4. Baseline circulating tumor cells and survival
+
+> **Question from Quentin:**\
+> “Could you also evaluate PFS and OS according to CTC at inclusion?”
+
+## Statistical analysis
+
+Baseline CTC status was analyzed as a binary variable. Patients with a CTC value equal to 0 were classified as CTC absent, whereas patients with a CTC value greater than 0 were classified as CTC present. Patients with missing baseline CTC data were excluded from this analysis.
+
+PFS and OS were compared according to baseline CTC status using Kaplan-Meier estimates, log-rank tests, and univariable Cox proportional hazards models.
+
+```{r}
+#| label: prepare-ctc
+#| echo: false
+
+df_ctc <- df |>
+  filter(!is.na(ctc_t1)) |>
+  mutate(
+    ctc_status = case_when(
+      ctc_t1 == 0 ~ "Absent",
+      ctc_t1 > 0  ~ "Present"
+    ),
+    ctc_status = factor(
+      ctc_status,
+      levels = c("Absent", "Present")
+    )
+  )
+```
+
+## Group composition
+
+```{r}
+#| label: ctc-count
+#| echo: false
+
+df_ctc |>
+  count(ctc_status) |>
+  rename(
+    `CTC status` = ctc_status,
+    N = n
+  ) |>
+  gt()
+```
+
+## Progression-free survival
+
+```{r}
+#| label: km-ctc-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+km_ctc_pfs <- survfit(
+  Surv(pfs_days, pfs_event) ~ ctc_status,
+  data = df_ctc
+)
+
+plot(
+  km_ctc_pfs,
+  xlab = "Time from inclusion (days)",
+  ylab = "Progression-free survival probability",
+  lty = 1:2,
+  lwd = 2,
+  mark.time = TRUE
+)
+
+legend(
+  "bottomleft",
+  legend = c("CTC absent", "CTC present"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+```
+
+```{r}
+#| label: risk-ctc-pfs
+#| echo: false
+
+summary(
+  km_ctc_pfs,
+  times = c(0, 180, 360, 540, 720, 900),
+  extend = TRUE
+) |>
+  with(
+    tibble(
+      Group = sub("ctc_status=", "", strata),
+      Time = time,
+      `Number at risk` = n.risk
+    )
+  ) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+```
+
+## Overall survival
+
+```{r}
+#| label: km-ctc-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+km_ctc_os <- survfit(
+  Surv(os_days, os_event) ~ ctc_status,
+  data = df_ctc
+)
+
+plot(
+  km_ctc_os,
+  xlab = "Time from inclusion (days)",
+  ylab = "Overall survival probability",
+  lty = 1:2,
+  lwd = 2,
+  mark.time = TRUE
+)
+
+legend(
+  "bottomleft",
+  legend = c("CTC absent", "CTC present"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+```
+
+```{r}
+#| label: risk-ctc-os
+#| echo: false
+
+summary(
+  km_ctc_os,
+  times = c(0, 180, 360, 540, 720, 900),
+  extend = TRUE
+) |>
+  with(
+    tibble(
+      Group = sub("ctc_status=", "", strata),
+      Time = time,
+      `Number at risk` = n.risk
+    )
+  ) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+
+#| label: survival-summary-ctc
+#| echo: false
+
+ctc_pfs_tab <- as.data.frame(summary(km_ctc_pfs)$table) |>
+  tibble::rownames_to_column("Group") |>
+  mutate(
+    Group = sub("ctc_status=", "", Group),
+    Outcome = "PFS"
+  )
+
+ctc_os_tab <- as.data.frame(summary(km_ctc_os)$table) |>
+  tibble::rownames_to_column("Group") |>
+  mutate(
+    Group = sub("ctc_status=", "", Group),
+    Outcome = "OS"
+  )
+
+bind_rows(ctc_pfs_tab, ctc_os_tab) |>
+  mutate(
+    `Median survival` = ifelse(
+      is.na(median),
+      "Not reached",
+      sprintf("%.0f days (%.1f months)", median, median / 30.44)
+    )
+  ) |>
+  transmute(
+    Outcome,
+    Group,
+    N = records,
+    Events = events,
+    `Median survival`
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Survival summary according to baseline CTC status"
+  )
+```
+
+## Cox estimates
+
+```{r}
+#| label: cox-ctc
+#| echo: true
+
+cox_ctc_pfs <- coxph(
+  Surv(pfs_days, pfs_event) ~ ctc_status,
+  data = df_ctc
+)
+
+cox_ctc_os <- coxph(
+  Surv(os_days, os_event) ~ ctc_status,
+  data = df_ctc
+)
+```
+
+```{r}
+#| label: table-ctc
+#| echo: false
+
+ctc_results <- bind_rows(
+
+  tidy(cox_ctc_pfs, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "PFS",
+      N = cox_ctc_pfs$n,
+      Events = cox_ctc_pfs$nevent
+    ),
+
+  tidy(cox_ctc_os, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "OS",
+      N = cox_ctc_os$n,
+      Events = cox_ctc_os$nevent
+    )
+) |>
+  transmute(
+    Outcome,
+    Predictor = "Baseline CTC status",
+    Scale = "Present vs Absent",
+    N,
+    Events,
+    HR = estimate,
+    CI_low = conf.low,
+    CI_high = conf.high,
+    p_value = p.value
+  ) |>
+  mutate(
+    `HR [95% CI]` = sprintf(
+      "%.2f [%.2f–%.2f]",
+      HR, CI_low, CI_high
+    ),
+    `p-value` = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  select(
+    Outcome,
+    Predictor,
+    Scale,
+    N,
+    Events,
+    `HR [95% CI]`,
+    `p-value`
+  )
+
+ctc_results |> gt()
+```
+
+# 5. Baseline circulating tumor DNA and survival
+
+> **Question from Quentin:**\
+> “Could you perform the same analysis using circulating tumor DNA?”
+
+## Statistical analysis
+
+Baseline ctDNA was analyzed as a continuous variable using separate univariable Cox proportional hazards models for PFS and OS.
+
+For easier interpretation, ctDNA values were divided by 100. Hazard ratios therefore represent a 100-unit increase in baseline ctDNA.
+
+```{r}
+#| label: prepare-ctdna
+#| echo: false
+
+df <- df |>
+  mutate(
+    ctdna_t1_100 = ctdna_t1 / 100
+  )
+```
+
+```{r}
+#| label: cox-ctdna
+#| echo: true
+
+cox_ctdna_pfs <- coxph(
+  Surv(pfs_days, pfs_event) ~ ctdna_t1_100,
+  data = df
+)
+
+cox_ctdna_os <- coxph(
+  Surv(os_days, os_event) ~ ctdna_t1_100,
+  data = df
+)
+```
+
+## Results
+
+```{r}
+#| label: table-ctdna
+#| echo: false
+
+ctdna_results <- bind_rows(
+  
+  tidy(cox_ctdna_pfs, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "PFS",
+      N = cox_ctdna_pfs$n,
+      Events = cox_ctdna_pfs$nevent
+    ),
+  
+  tidy(cox_ctdna_os, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "OS",
+      N = cox_ctdna_os$n,
+      Events = cox_ctdna_os$nevent
+    )
+) |>
+  transmute(
+    Outcome,
+    Predictor = "Baseline ctDNA",
+    Scale = "+100 units",
+    N,
+    Events,
+    HR = estimate,
+    CI_low = conf.low,
+    CI_high = conf.high,
+    p_value = p.value
+  ) |>
+  mutate(
+    `HR [95% CI]` = sprintf(
+      "%.2f [%.2f–%.2f]",
+      HR, CI_low, CI_high
+    ),
+    `p-value` = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  select(
+    Outcome,
+    Predictor,
+    Scale,
+    N,
+    Events,
+    `HR [95% CI]`,
+    `p-value`
+  )
+
+ctdna_results |> gt()
+```
+
+# 6. ctDNA clearance at T2 and survival
+
+> **Question from Quentin:**\
+> “Could you also evaluate survival according to clearance of circulating tumor DNA at T2, i.e. patients with no remaining ctDNA (value 0) versus the others?”
+
+## Statistical analysis
+
+Patients with a T2 ctDNA value equal to 0 were classified as having ctDNA clearance.
+
+Patients with a T2 ctDNA value greater than 0 were classified as having no clearance.
+
+Patients with missing T2 ctDNA were excluded.
+
+```{r}
+#| label: prepare-clearance
+#| echo: false
+
+df_clearance <- df |>
+  mutate(
+    clearance = case_when(
+      ctdna_t2 == 0 ~ "Clearance",
+      ctdna_t2 > 0 ~ "No clearance",
+      TRUE ~ NA_character_
+    ),
+    clearance = factor(
+      clearance,
+      levels = c("No clearance", "Clearance")
+    )
+  ) |>
+  filter(!is.na(clearance))
+```
+
+## Group composition
+
+```{r}
+#| label: clearance-count
+#| echo: false
+
+df_clearance |>
+  count(clearance) |>
+  rename(
+    Group = clearance,
+    N = n
+  ) |>
+  gt()
+```
+
+## Progression-free survival
+
+```{r}
+#| label: km-clearance-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+km_clearance_pfs <- survfit(
+  Surv(pfs_days, pfs_event) ~ clearance,
+  data = df_clearance
+)
+
+plot(
+  km_clearance_pfs,
+  xlab = "Time from inclusion (days)",
+  ylab = "Progression-free survival probability",
+  lty = 1:2,
+  lwd = 2,
+  mark.time = TRUE
+)
+
+legend(
+  "bottomleft",
+  legend = c("No clearance", "Clearance"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+#| echo: false
+
+summary(km_clearance_pfs, times = c(0, 180, 360, 540, 720, 900), extend = TRUE) |>
+  with(
+    tibble(
+      Group = sub("clearance=", "", strata),
+      Time = time,
+      `Number at risk` = n.risk
+    )
+  ) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+```
+
+```{r}
+#| label: logrank-clearance-pfs
+#| echo: false
+
+logrank_clearance_pfs <- survdiff(
+  Surv(pfs_days, pfs_event) ~ clearance,
+  data = df_clearance
+)
+
+p_clearance_pfs <- pchisq(
+  logrank_clearance_pfs$chisq,
+  df = 1,
+  lower.tail = FALSE
+)
+
+tibble(
+  Test = "Log-rank",
+  `p-value` = ifelse(
+    p_clearance_pfs < 0.001,
+    "<0.001",
+    sprintf("%.3f", p_clearance_pfs)
+  )
+) |> gt()
+```
+
+## Overall survival
+
+```{r}
+#| label: km-clearance-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+km_clearance_os <- survfit(
+  Surv(os_days, os_event) ~ clearance,
+  data = df_clearance
+)
+
+plot(
+  km_clearance_os,
+  xlab = "Time from inclusion (days)",
+  ylab = "Overall survival probability",
+  lty = 1:2,
+  lwd = 2,
+  mark.time = TRUE
+)
+
+legend(
+  "bottomleft",
+  legend = c("No clearance", "Clearance"),
+  lty = 1:2,
+  lwd = 2,
+  bty = "n"
+)
+
+#| echo: false
+
+summary(km_clearance_os, times = c(0, 180, 360, 540, 720, 900), extend = TRUE) |>
+  with(
+    tibble(
+      Group = sub("clearance=", "", strata),
+      Time = time,
+      `Number at risk` = n.risk
+    )
+  ) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+```
+
+```{r}
+#| label: logrank-clearance-os
+#| echo: false
+
+logrank_clearance_os <- survdiff(
+  Surv(os_days, os_event) ~ clearance,
+  data = df_clearance
+)
+
+p_clearance_os <- pchisq(
+  logrank_clearance_os$chisq,
+  df = 1,
+  lower.tail = FALSE
+)
+
+tibble(
+  Test = "Log-rank",
+  `p-value` = ifelse(
+    p_clearance_os < 0.001,
+    "<0.001",
+    sprintf("%.3f", p_clearance_os)
+  )
+) |> gt()
+
+#| label: survival-summary-clearance
+#| echo: false
+
+clearance_pfs_tab <- as.data.frame(summary(km_clearance_pfs)$table) |>
+  tibble::rownames_to_column("Group") |>
+  mutate(
+    Group = sub("clearance=", "", Group),
+    Outcome = "PFS"
+  )
+
+clearance_os_tab <- as.data.frame(summary(km_clearance_os)$table) |>
+  tibble::rownames_to_column("Group") |>
+  mutate(
+    Group = sub("clearance=", "", Group),
+    Outcome = "OS"
+  )
+
+bind_rows(clearance_pfs_tab, clearance_os_tab) |>
+  mutate(
+    `Median survival` = ifelse(
+      is.na(median),
+      "Not reached",
+      sprintf("%.0f days (%.1f months)", median, median / 30.44)
+    ),
+    `95% CI` = ifelse(
+      is.na(`0.95LCL`) | is.na(`0.95UCL`),
+      "Not estimable",
+      sprintf("%.0f–%.0f days", `0.95LCL`, `0.95UCL`)
+    )
+  ) |>
+  transmute(
+    Outcome,
+    Group,
+    N = records,
+    Events = events,
+    `Median survival` = `Median survival`,
+    `95% CI` = `95% CI`
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Survival summary according to ctDNA clearance at T2"
+  )
+```
+
+## Cox estimates
+
+```{r}
+#| label: cox-clearance
+#| echo: true
+
+cox_clearance_pfs <- coxph(
+  Surv(pfs_days, pfs_event) ~ clearance,
+  data = df_clearance
+)
+
+cox_clearance_os <- coxph(
+  Surv(os_days, os_event) ~ clearance,
+  data = df_clearance
+)
+```
+
+```{r}
+#| label: table-clearance
+#| echo: false
+
+clearance_results <- bind_rows(
+  
+  tidy(cox_clearance_pfs, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "PFS",
+      N = cox_clearance_pfs$n,
+      Events = cox_clearance_pfs$nevent
+    ),
+  
+  tidy(cox_clearance_os, exponentiate = TRUE, conf.int = TRUE) |>
+    mutate(
+      Outcome = "OS",
+      N = cox_clearance_os$n,
+      Events = cox_clearance_os$nevent
+    )
+) |>
+  transmute(
+    Outcome,
+    Predictor = "ctDNA clearance at T2",
+    Scale = "Clearance vs No clearance",
+    N,
+    Events,
+    HR = estimate,
+    CI_low = conf.low,
+    CI_high = conf.high,
+    p_value = p.value
+  ) |>
+  mutate(
+    `HR [95% CI]` = sprintf(
+      "%.2f [%.2f–%.2f]",
+      HR, CI_low, CI_high
+    ),
+    `p-value` = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) |>
+  select(
+    Outcome,
+    Predictor,
+    Scale,
+    N,
+    Events,
+    `HR [95% CI]`,
+    `p-value`
+  )
+
+clearance_results |> gt()
+```
+
+# 7. Summary of requested survival analyses
+
+```{r}
+#| label: final-summary
+#| echo: false
+
+final_results <- bind_rows(
+  hscore_results,
+  hscore_group_results,
+  ctc_results,
+  ctdna_results,
+  clearance_results
+)
+
+final_results |>
+  arrange(Outcome, Predictor) |>
+  gt() |>
+  tab_header(
+    title = "Summary of univariable survival analyses",
+    subtitle = "Hazard ratios with 95% confidence intervals"
+  )
+
+#| label: km-overall-pfs
+#| echo: false
+#| fig-width: 8
+#| fig-height: 6
+
+# Kaplan-Meier estimate
+km_all_pfs <- survfit(
+  Surv(pfs_days, pfs_event) ~ 1,
+  data = df
+)
+
+# Time points every 6 months (~180 days)
+risk_times_pfs <- seq(
+  0,
+  max(df$pfs_days, na.rm = TRUE),
+  by = 180
+)
+
+# Survival curve data
+km_pfs_plot_data <- data.frame(
+  time = km_all_pfs$time,
+  survival = km_all_pfs$surv,
+  censored = km_all_pfs$n.censor
+)
+
+# Number at risk
+km_pfs_risk <- summary(
+  km_all_pfs,
+  times = risk_times_pfs,
+  extend = TRUE
+)
+
+risk_pfs_data <- data.frame(
+  time = km_pfs_risk$time,
+  n_risk = km_pfs_risk$n.risk
+)
+
+# Kaplan-Meier curve
+p_pfs <- ggplot(
+  km_pfs_plot_data,
+  aes(x = time, y = survival)
+) +
+  geom_step(
+    linewidth = 1
+  ) +
+  geom_point(
+    data = subset(km_pfs_plot_data, censored > 0),
+    shape = 3,
+    size = 2.5
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_x_continuous(
+    breaks = risk_times_pfs
+  ) +
+  labs(
+    x = "Time from inclusion (days)",
+    y = "Progression-free survival probability"
+  ) +
+  theme_classic(base_size = 13)
+
+p_pfs
+
+#| label: risk-overall-pfs
+#| echo: false
+
+s_pfs <- summary(
+  km_all_pfs,
+  times = c(0, 180, 360, 540, 720, 900),
+  extend = TRUE
+)
+
+tibble(
+  Group = "Overall cohort",
+  Time = s_pfs$time,
+  `Number at risk` = s_pfs$n.risk
+) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Number at risk"
+  )
+#| label: median-overall-pfs
+#| echo: false
+
+overall_pfs_table <- summary(km_all_pfs)$table
+
+tibble(
+  Population = "Overall cohort",
+  
+  `Median PFS` = ifelse(
+    is.na(overall_pfs_table["median"]),
+    "Not reached",
+    sprintf(
+      "%.0f days (%.1f months)",
+      overall_pfs_table["median"],
+      overall_pfs_table["median"] / 30.44
+    )
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "Median progression-free survival of the entire cohort"
+  )
+```
+
+# Overall survival of the entire cohort
+
+> **Overall cohort analysis:**\
+> Overall survival was estimated using the Kaplan-Meier method for the entire study population. Censored observations are indicated by vertical marks. The number of patients at risk is reported below the survival curve.
+
+```{r}
+#| label: km-overall-cohort
+#| echo: false
+#| fig-width: 8
+#| fig-height: 6
+
+# Kaplan-Meier estimate
+km_all_os <- survfit(
+  Surv(os_days, os_event) ~ 1,
+  data = df
+)
+
+# Time points every 6 months (~180 days)
+risk_times <- seq(
+  0,
+  max(df$os_days, na.rm = TRUE),
+  by = 180
+)
+
+# Survival curve data
+km_plot_data <- data.frame(
+  time = km_all_os$time,
+  survival = km_all_os$surv,
+  censored = km_all_os$n.censor
+)
+
+# Number at risk
+km_risk <- summary(
+  km_all_os,
+  times = risk_times,
+  extend = TRUE
+)
+
+risk_data <- data.frame(
+  time = km_risk$time,
+  n_risk = km_risk$n.risk
+)
+
+# Kaplan-Meier curve
+p_os <- ggplot(
+  km_plot_data,
+  aes(x = time, y = survival)
+) +
+  geom_step(
+    linewidth = 1
+  ) +
+  geom_point(
+    data = subset(km_plot_data, censored > 0),
+    shape = 3,
+    size = 2.5
+  ) +
+  scale_y_continuous(
+    limits = c(-0.18, 1),
+    breaks = seq(0, 1, 0.2),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_x_continuous(
+    breaks = risk_times
+  ) +
+  labs(
+    x = "Time from inclusion (days)",
+    y = "Overall survival probability"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.margin = margin(10, 15, 35, 45)
+  )
+
+#| echo: false
+
+s_os <- summary(
+  km_all_os,
+  times = c(0, 180, 360, 540, 720, 900),
+  extend = TRUE
+)
+
+tibble(
+  Group = "Overall cohort",
+  Time = s_os$time,
+  `Number at risk` = s_os$n.risk
+) |>
+  pivot_wider(
+    names_from = Time,
+    values_from = `Number at risk`
+  ) |>
+  gt() |>
+  tab_header(title = "Number at risk")
+
+p_os
+
+#| label: overall-survival-summary
+#| echo: false
+
+km_all_pfs <- survfit(
+  Surv(pfs_days, pfs_event) ~ 1,
+  data = df
+)
+
+pfs_overall <- summary(km_all_pfs)$table
+os_overall  <- summary(km_all_os)$table
+
+overall_survival_summary <- tibble(
+  Outcome = c("PFS", "OS"),
+  
+  N = c(
+    unname(pfs_overall["records"]),
+    unname(os_overall["records"])
+  ),
+  
+  Events = c(
+    unname(pfs_overall["events"]),
+    unname(os_overall["events"])
+  ),
+  
+  `Median survival` = c(
+    ifelse(
+      is.na(pfs_overall["median"]),
+      "Not reached",
+      sprintf(
+        "%.0f days (%.1f months)",
+        pfs_overall["median"],
+        pfs_overall["median"] / 30.44
+      )
+    ),
+    ifelse(
+      is.na(os_overall["median"]),
+      "Not reached",
+      sprintf(
+        "%.0f days (%.1f months)",
+        os_overall["median"],
+        os_overall["median"] / 30.44
+      )
+    )
+  ),
+  
+  `95% CI` = c(
+    ifelse(
+      is.na(pfs_overall["0.95LCL"]) | is.na(pfs_overall["0.95UCL"]),
+      "Not estimable",
+      sprintf(
+        "%.0f–%.0f days",
+        pfs_overall["0.95LCL"],
+        pfs_overall["0.95UCL"]
+      )
+    ),
+    ifelse(
+      is.na(os_overall["0.95LCL"]) | is.na(os_overall["0.95UCL"]),
+      "Not estimable",
+      sprintf(
+        "%.0f–%.0f days",
+        os_overall["0.95LCL"],
+        os_overall["0.95UCL"]
+      )
+    )
+  )
+)
+
+overall_survival_summary |>
+  gt() |>
+  tab_header(
+    title = "Overall survival outcomes in the complete cohort"
+  )
+```
+
+# 
+
+```{r}
+#| label: overall-os-summary
+#| echo: false
+
+tibble(
+  Patients = nrow(df),
+  Deaths = sum(df$os_event == 1, na.rm = TRUE),
+  Censored = sum(df$os_event == 0, na.rm = TRUE)
+) |>
+  gt() |>
+  tab_header(
+    title = "Overall survival events"
+  )
+```
+
+# Statistical interpretation
+
+These analyses are exploratory and univariable.
+
+The PFS analysis includes only 9 events in the complete cohort. Consequently, confidence intervals may be wide and estimates should be interpreted primarily according to their magnitude and precision rather than according to statistical significance alone.
+
+# 
+
+# Publication figures
+
+The following figures reproduce the survival analyses presented above using a standardized graphical format intended for publication. No statistical analysis was recalculated or modified.
+
+```{r}
+#| label: publication-km-function
+#| include: false
+
+plot_km_publication <- function(
+  fit,
+  ylab,
+  legend_labels = NULL,
+  title = NULL,
+  x_breaks = seq(0, 900, 180)
+) {
+
+  n_groups <- if (is.null(fit$strata)) {
+    1
+  } else {
+    length(fit$strata)
+  }
+
+  pub_colors <- if (n_groups == 1) {
+    "#2C5F8A"
+  } else {
+    c("#2C5F8A", "#B44A3C")
+  }
+
+  par(
+    mar = c(5, 5, 2.5, 1),
+    las = 1
+  )
+
+  plot(
+    fit,
+    xlab = "Time from inclusion (days)",
+    ylab = ylab,
+    main = title,
+    xlim = c(0, max(x_breaks)),
+    ylim = c(0, 1),
+    xaxt = "n",
+    yaxt = "n",
+    col = pub_colors,
+    lty = 1,
+    lwd = 2.8,
+    mark.time = TRUE,
+    cex.lab = 1.15,
+    bty = "l",
+    conf.int = FALSE
+  )
+
+  axis(
+    side = 1,
+    at = x_breaks,
+    labels = x_breaks
+  )
+
+  axis(
+    side = 2,
+    at = seq(0, 1, 0.2),
+    labels = paste0(seq(0, 100, 20), "%"),
+    las = 1
+  )
+
+  if (!is.null(legend_labels)) {
+    legend(
+      "topright",
+      legend = legend_labels,
+      col = pub_colors,
+      lty = 1,
+      lwd = 2.8,
+      bty = "n",
+      cex = 0.95
+    )
+  }
+}
+```
+
+## Nuclear H-score
+
+### Progression-free survival
+
+```{r}
+#| label: pub-km-hscore-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_hscore_pfs,
+  ylab = "Progression-free survival probability",
+  legend_labels = c(
+    "H-score <100",
+    "H-score >200"
+  )
+)
+```
+
+### Overall survival
+
+```{r}
+#| label: pub-km-hscore-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_hscore_os,
+  ylab = "Overall survival probability",
+  legend_labels = c(
+    "H-score <100",
+    "H-score >200"
+  )
+)
+```
+
+## Baseline CTC status
+
+### Progression-free survival
+
+```{r}
+#| label: pub-km-ctc-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_ctc_pfs,
+  ylab = "Progression-free survival probability",
+  legend_labels = c(
+    "CTC absent",
+    "CTC present"
+  )
+)
+```
+
+### Overall survival
+
+```{r}
+#| label: pub-km-ctc-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_ctc_os,
+  ylab = "Overall survival probability",
+  legend_labels = c(
+    "CTC absent",
+    "CTC present"
+  )
+)
+```
+
+## ctDNA clearance at T2
+
+### Progression-free survival
+
+```{r}
+#| label: pub-km-clearance-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_clearance_pfs,
+  ylab = "Progression-free survival probability",
+  legend_labels = c(
+    "No clearance",
+    "Clearance"
+  )
+)
+```
+
+### Overall survival
+
+```{r}
+#| label: pub-km-clearance-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_clearance_os,
+  ylab = "Overall survival probability",
+  legend_labels = c(
+    "No clearance",
+    "Clearance"
+  )
+)
+```
+
+## Overall cohort
+
+### Progression-free survival
+
+```{r}
+#| label: pub-km-overall-pfs
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_all_pfs,
+  ylab = "Progression-free survival probability"
+)
+```
+
+### Overall survival
+
+```{r}
+#| label: pub-km-overall-os
+#| echo: false
+#| fig-width: 7
+#| fig-height: 5
+
+plot_km_publication(
+  fit = km_all_os,
+  ylab = "Overall survival probability"
+)
+```

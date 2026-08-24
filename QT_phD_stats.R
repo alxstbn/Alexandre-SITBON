@@ -1,0 +1,12 @@
+install.packages(c(
+  "readxl",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "survival",
+  "survminer",
+  "broom",
+  "gtsummary",
+  "gt"
+))
+
